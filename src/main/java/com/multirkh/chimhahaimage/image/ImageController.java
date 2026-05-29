@@ -2,7 +2,6 @@ package com.multirkh.chimhahaimage.image;
 
 import com.multirkh.chimhahaimage.image.dtos.PresignedPostDto;
 import com.multirkh.chimhahaimage.image.dtos.PresignedUrlDTO;
-import jakarta.annotation.security.RolesAllowed;
 import lombok.RequiredArgsConstructor;
 import org.springframework.util.MimeType;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -15,13 +14,11 @@ import org.springframework.web.bind.annotation.RestController;
 public class ImageController {
     private final ImageService imageService;
 
-    @RolesAllowed("USER")
     @GetMapping("/get/presigned-url")
     public PresignedUrlDTO getPresignedUrl() {
         return imageService.getPresignedUrl();
     }
 
-    @RolesAllowed("USER")
     @GetMapping("/get/presigned-post")
     public PresignedPostDto getPresignedPost(
             @RequestHeader("X-File-MimeType") MimeType mimeType,
