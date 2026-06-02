@@ -186,4 +186,40 @@ class ImageServiceTest {
         verify(minioService).createThumbnail(FILE_NAME);
         verify(imageRepository).save(any(Image.class));
     }
+
+    // ─── getThumbnailSrcUrl ───────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("getThumbnailSrcUrl: 썸네일이 있고 만료가 충분히 남으면 기존 URL을 그대로 반환한다")
+    void getThumbnailSrcUrl_whenNotSoonExpired_returnsExistingUrl() {
+        Image rawImage = new Image(FILE_NAME, "image/jpeg", PRESIGNED_URL,
+                ZonedDateTime.now().plusHours(168));
+        Image thumbnail = new Image(rawImage, "http://thumbnail-url",
+                ZonedDateTime.now().plusHours(168));
+        rawImage.setThumbNailImage(thumbnail);
+        when(imageRepository.findByFileName(FILE_NAME)).thenReturn(rawImage);
+
+        String result = imageService.getThumbnailSrcUrl(FILE_NAME);
+
+        assertThat(result).isEqualTo("http://thumbnail-url");
+        verify(minioService, never()).createThumbnail(anyString());
+        verify(minioService, never()).createOrRenewUrl(anyString());
+    }
+
+    @Test
+    @DisplayName("getThumbnailSrcUrl: 썸네일이 곧 만료되면 URL을 갱신해 반환한다")
+    void getThumbnailSrcUrl_whenSoonExpired_renewsUrl() {
+        Image rawImage = new Image(FILE_NAME, "image/jpeg", PRESIGNED_URL,
+                ZonedDateTime.now().plusHours(168));
+        Image thumbnail = new Image(rawImage, "http://old-thumbnail-url",
+                ZonedDateTime.now().minusMinutes(1));
+        rawImage.setThumbNailImage(thumbnail);
+        when(imageRepository.findByFileName(FILE_NAME)).thenReturn(rawImage);
+        when(minioService.createOrRenewUrl(FILE_NAME)).thenReturn("http://renewed-url");
+
+        String result = imageService.getThumbnailSrcUrl(FILE_NAME);
+
+        assertThat(result).isEqualTo("http://renewed-url");
+        verify(minioService).createOrRenewUrl(FILE_NAME);
+    }
 }
