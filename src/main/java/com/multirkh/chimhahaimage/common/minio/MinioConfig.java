@@ -2,16 +2,7 @@ package com.multirkh.chimhahaimage.common.minio;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.minio.BucketExistsArgs;
-import io.minio.DeleteBucketCorsArgs;
-import io.minio.MakeBucketArgs;
-import io.minio.MinioClient;
-import io.minio.SetBucketCorsArgs;
-import io.minio.SetBucketPolicyArgs;
-import io.minio.messages.CORSConfiguration;
-import io.minio.messages.CORSConfiguration.CORSRule;
-import java.util.Arrays;
-import java.util.Collections;
+import java.net.URI;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -19,6 +10,21 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.S3Configuration;
+import software.amazon.awssdk.services.s3.model.CORSConfiguration;
+import software.amazon.awssdk.services.s3.model.CORSRule;
+import software.amazon.awssdk.services.s3.model.CreateBucketRequest;
+import software.amazon.awssdk.services.s3.model.DeleteBucketCorsRequest;
+import software.amazon.awssdk.services.s3.model.HeadBucketRequest;
+import software.amazon.awssdk.services.s3.model.NoSuchBucketException;
+import software.amazon.awssdk.services.s3.model.PutBucketCorsRequest;
+import software.amazon.awssdk.services.s3.model.PutBucketPolicyRequest;
+import software.amazon.awssdk.services.s3.model.S3Exception;
+import software.amazon.awssdk.services.s3.presigner.S3Presigner;
 
 @Configuration
 @Slf4j
@@ -35,6 +41,9 @@ public class MinioConfig {
     @Value("${minio.secret-key}")
     private String minioSecretKey;
 
+    @Value("${minio.region}")
+    private String region;
+
     @Value("${minio.bucket-name}")
     private String minioBucketName;
     @Value("${minio.thumbnail-bucket-name}")
@@ -47,41 +56,80 @@ public class MinioConfig {
     }
 
     @Bean
-    public MinioClient minioClient() {
-        MinioClient minioClient = initMinioConfig();
-        Map<String, Boolean> minioBuckets = initMinioBuckets(minioClient);
-        for (Map.Entry<String, Boolean> entry : minioBuckets.entrySet()) {
-            try {
-                minioClient.deleteBucketCors(DeleteBucketCorsArgs.builder().bucket(entry.getKey()).build());
-                CORSConfiguration config = getCorsConfiguration();
-                minioClient.setBucketCors(
-                        SetBucketCorsArgs.builder().bucket(entry.getKey()).config(config).build());
-            } catch (Exception e) {
-                throw new RuntimeException(e);
-            }
-        }
-        return minioClient;
+    public S3Client s3Client() {
+        S3Client s3Client = S3Client.builder()
+                .endpointOverride(URI.create(minioExportUrl))
+                .region(Region.of(region))
+                .credentialsProvider(credentialsProvider())
+                .serviceConfiguration(pathStyleConfig())
+                .build();
+        initBuckets(s3Client);
+        return s3Client;
     }
 
-    private Map<String, Boolean> initMinioBuckets(MinioClient minioClient) {
-        try {
-            Map<String, Boolean> bucketDoesExists = new HashMap<>();
-            bucketDoesExists.put(minioBucketName,
-                    minioClient.bucketExists(BucketExistsArgs.builder().bucket(minioBucketName).build()));
-            bucketDoesExists.put(thumbnailBucketName,
-                    minioClient.bucketExists(BucketExistsArgs.builder().bucket(thumbnailBucketName).build()));
-            for (Map.Entry<String, Boolean> entry : bucketDoesExists.entrySet()) {
-                if (!entry.getValue()) {
-                    minioClient.makeBucket(MakeBucketArgs.builder().bucket(entry.getKey()).build());
-                } else {
-                    log.info("Bucket '{}' already exists.", entry.getKey());
-                }
+    @Bean
+    public S3Presigner s3Presigner() {
+        return S3Presigner.builder()
+                .endpointOverride(URI.create(minioExportUrl))
+                .region(Region.of(region))
+                .credentialsProvider(credentialsProvider())
+                .serviceConfiguration(pathStyleConfig())
+                .build();
+    }
+
+    private StaticCredentialsProvider credentialsProvider() {
+        return StaticCredentialsProvider.create(
+                AwsBasicCredentials.create(minioAccessKey, minioSecretKey));
+    }
+
+    // SeaweedFS는 path-style 접근만 지원 (가상 호스팅 스타일 미지원).
+    private S3Configuration pathStyleConfig() {
+        return S3Configuration.builder().pathStyleAccessEnabled(true).build();
+    }
+
+    private void initBuckets(S3Client s3Client) {
+        Map<String, Boolean> bucketExists = new HashMap<>();
+        bucketExists.put(minioBucketName, bucketExists(s3Client, minioBucketName));
+        bucketExists.put(thumbnailBucketName, bucketExists(s3Client, thumbnailBucketName));
+        for (Map.Entry<String, Boolean> entry : bucketExists.entrySet()) {
+            if (!entry.getValue()) {
+                s3Client.createBucket(CreateBucketRequest.builder().bucket(entry.getKey()).build());
+            } else {
+                log.info("Bucket '{}' already exists.", entry.getKey());
             }
-            initBucketPolicy(minioClient);
-            return bucketDoesExists;
-        } catch (Exception e) {
-            throw new RuntimeException("Error occurred while creating minio client", e);
         }
+        initBucketPolicy(s3Client);
+        for (String bucket : bucketExists.keySet()) {
+            applyCors(s3Client, bucket);
+        }
+    }
+
+    private boolean bucketExists(S3Client s3Client, String bucket) {
+        try {
+            s3Client.headBucket(HeadBucketRequest.builder().bucket(bucket).build());
+            return true;
+        } catch (NoSuchBucketException e) {
+            return false;
+        } catch (S3Exception e) {
+            if (e.statusCode() == 404) {
+                return false;
+            }
+            throw e;
+        }
+    }
+
+    private void applyCors(S3Client s3Client, String bucket) {
+        s3Client.deleteBucketCors(DeleteBucketCorsRequest.builder().bucket(bucket).build());
+        CORSRule rule = CORSRule.builder()
+                .allowedHeaders("*")
+                .allowedMethods("PUT", "POST")
+                .allowedOrigins(spaUrl)
+                .maxAgeSeconds(3000)
+                .build();
+        s3Client.putBucketCors(PutBucketCorsRequest.builder()
+                .bucket(bucket)
+                .corsConfiguration(CORSConfiguration.builder().corsRules(rule).build())
+                .build());
     }
 
     private String createPublicReadAccessJsonPolicy(String minioBucketName) {
@@ -104,38 +152,11 @@ public class MinioConfig {
         }
     }
 
-
-    private void initBucketPolicy(MinioClient minioClient) {
-        try {
-            String policyJson = createPublicReadAccessJsonPolicy(minioBucketName);
-            minioClient.setBucketPolicy(
-                    SetBucketPolicyArgs.builder().bucket(minioBucketName).config(policyJson).build());
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
-    }
-
-    private MinioClient initMinioConfig() {
-        try {
-            return MinioClient.builder()
-                    .endpoint(minioExportUrl)
-                    .credentials(minioAccessKey, minioSecretKey)
-                    .build();
-        } catch (Exception e) {
-            throw new RuntimeException("Minio Client Error");
-        }
-    }
-
-    private CORSConfiguration getCorsConfiguration() {
-        List<String> allowedOrigins = Collections.singletonList(spaUrl);
-        return new CORSConfiguration(
-                List.of(new CORSRule(
-                        List.of("*"),
-                        Arrays.asList("PUT", "POST"),
-                        allowedOrigins,
-                        null,
-                        null,
-                        3000))
-        );
+    private void initBucketPolicy(S3Client s3Client) {
+        String policyJson = createPublicReadAccessJsonPolicy(minioBucketName);
+        s3Client.putBucketPolicy(PutBucketPolicyRequest.builder()
+                .bucket(minioBucketName)
+                .policy(policyJson)
+                .build());
     }
 }

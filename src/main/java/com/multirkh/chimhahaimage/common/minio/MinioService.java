@@ -1,37 +1,41 @@
 package com.multirkh.chimhahaimage.common.minio;
 
 import com.multirkh.chimhahaimage.image.resize.ImageResizerService;
-import io.minio.GetObjectArgs;
-import io.minio.GetPresignedObjectUrlArgs;
-import io.minio.MinioClient;
-import io.minio.PostPolicy;
-import io.minio.PutObjectArgs;
-import io.minio.RemoveObjectArgs;
-import io.minio.RemoveObjectsArgs;
-import io.minio.Result;
-import io.minio.StatObjectArgs;
-import io.minio.StatObjectResponse;
-import io.minio.http.Method;
-import io.minio.messages.DeleteError;
-import io.minio.messages.DeleteObject;
+import java.io.IOException;
 import java.io.InputStream;
-import java.time.ZonedDateTime;
-import java.util.LinkedList;
+import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.TimeUnit;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.Delete;
+import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
+import software.amazon.awssdk.services.s3.model.DeleteObjectsRequest;
+import software.amazon.awssdk.services.s3.model.DeleteObjectsResponse;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
+import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
+import software.amazon.awssdk.services.s3.model.ObjectIdentifier;
+import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.services.s3.model.S3Error;
+import software.amazon.awssdk.services.s3.presigner.S3Presigner;
+import software.amazon.awssdk.services.s3.presigner.model.GetObjectPresignRequest;
+import software.amazon.awssdk.services.s3.presigner.model.PutObjectPresignRequest;
 
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class MinioService {
     private final ImageResizerService imageResizerService;
-    private final MinioClient minioClient;
+    private final S3Client s3Client;
+    private final S3Presigner s3Presigner;
+    private final S3PostPolicySigner postPolicySigner;
     @Value("${minio.bucket-name}")
     private String minioBucketName;
     @Value("${minio.thumbnail-bucket-name}")
@@ -40,76 +44,52 @@ public class MinioService {
     private String exportUrl;
 
     public String getPresignedUrl(String randomImageName) {
-        try {
-            return minioClient
-                    .getPresignedObjectUrl(
-                            GetPresignedObjectUrlArgs.builder()
-                                    .method(Method.PUT)
-                                    .bucket(minioBucketName)
-                                    .object(randomImageName)
-                                    .expiry(15, TimeUnit.MINUTES)
-                                    .build());
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
+        PutObjectRequest objectRequest = PutObjectRequest.builder()
+                .bucket(minioBucketName)
+                .key(randomImageName)
+                .build();
+        PutObjectPresignRequest presignRequest = PutObjectPresignRequest.builder()
+                .signatureDuration(Duration.ofMinutes(15))
+                .putObjectRequest(objectRequest)
+                .build();
+        return s3Presigner.presignPutObject(presignRequest).url().toString();
     }
 
-    public String getImageEndPointUrl(){
+    public String getImageEndPointUrl() {
         return String.join("/", List.of(exportUrl, minioBucketName));
     }
 
-    public Map<String, String> getPresignedPost(String fileName){
-        try{
-            PostPolicy postPolicy = new PostPolicy(minioBucketName, ZonedDateTime.now().plusMinutes(15));
-            postPolicy.addEqualsCondition("key", fileName);
-            postPolicy.addContentLengthRangeCondition(1, 10*1024*1024);
-            return minioClient.getPresignedPostFormData(postPolicy);
-        } catch (Exception e) {
-            throw  new RuntimeException(e);
-        }
+    public Map<String, String> getPresignedPost(String fileName) {
+        return postPolicySigner.presignedPostFields(minioBucketName, fileName);
     }
 
     public void deleteImages(Set<String> fileNames) {
-        List<DeleteObject> objects = new LinkedList<>();
+        List<ObjectIdentifier> objects = new ArrayList<>();
         for (String fileName : fileNames) {
-            objects.add(new DeleteObject(fileName));
+            objects.add(ObjectIdentifier.builder().key(fileName).build());
         }
-        try {
-            Iterable<Result<DeleteError>> results =
-                    minioClient.removeObjects(
-                            RemoveObjectsArgs.builder().bucket(minioBucketName).objects(objects).build());
-            for (Result<DeleteError> result : results) {
-                DeleteError error = result.get();
-                System.out.println(
-                        "Error in deleting object " + error.objectName() + "; " + error.message());
-            }
-        } catch (Exception e) {
-            throw new RuntimeException(e);
+        DeleteObjectsResponse response = s3Client.deleteObjects(
+                DeleteObjectsRequest.builder()
+                        .bucket(minioBucketName)
+                        .delete(Delete.builder().objects(objects).build())
+                        .build());
+        for (S3Error error : response.errors()) {
+            log.error("Error in deleting object {}; {}", error.key(), error.message());
         }
     }
 
     public void deleteImage(String fileName) {
-        try {
-            minioClient.removeObject(
-                    RemoveObjectArgs.builder()
-                            .bucket(minioBucketName)
-                            .object(fileName)
-                            .build());
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
+        s3Client.deleteObject(DeleteObjectRequest.builder()
+                .bucket(minioBucketName)
+                .key(fileName)
+                .build());
     }
 
     public InputStream getImage(String fileName) {
-        try {
-            return minioClient.getObject(
-                    GetObjectArgs.builder()
-                            .bucket(minioBucketName)
-                            .object(fileName)
-                            .build());
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
+        return s3Client.getObject(GetObjectRequest.builder()
+                .bucket(minioBucketName)
+                .key(fileName)
+                .build());
     }
 
     public String createThumbnail(String fileName) {
@@ -117,75 +97,53 @@ public class MinioService {
             String mimeType = getType(fileName);
             InputStream rawImage = getImage(fileName);
             InputStream resizedImageInputStream = imageResizerService.createResizedImage(rawImage);
-            minioClient.putObject(
-                    PutObjectArgs.builder()
+            byte[] resized = resizedImageInputStream.readAllBytes();
+            s3Client.putObject(
+                    PutObjectRequest.builder()
                             .bucket(thumbnailBucketName)
-                            .object(fileName)
-                            .stream(resizedImageInputStream, -1, 10485760)
+                            .key(fileName)
                             .contentType(mimeType)
-                            .build());
+                            .build(),
+                    RequestBody.fromBytes(resized));
             return createOrRenewThumbNailUrl(fileName);
-        } catch (Exception e) {
+        } catch (IOException e) {
             throw new RuntimeException(e);
         }
     }
 
     public void deleteThumbnail(String fileName) {
-        try {
-            minioClient.removeObject(
-                    RemoveObjectArgs.builder()
-                            .bucket(thumbnailBucketName)
-                            .object(fileName)
-                            .build());
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
+        s3Client.deleteObject(DeleteObjectRequest.builder()
+                .bucket(thumbnailBucketName)
+                .key(fileName)
+                .build());
     }
 
     public String createOrRenewUrl(String fileName) {
-        try {
-            String presignedObjectUrl = minioClient
-                    .getPresignedObjectUrl(
-                            GetPresignedObjectUrlArgs.builder()
-                                    .method(Method.GET)
-                                    .bucket(minioBucketName)
-                                    .object(fileName)
-                                    .expiry(7, TimeUnit.DAYS)
-                                    .build());
-            return presignedObjectUrl;
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
+        return presignGet(minioBucketName, fileName);
     }
 
     public String createOrRenewThumbNailUrl(String fileName) {
-        try {
-            return minioClient
-                    .getPresignedObjectUrl(
-                            GetPresignedObjectUrlArgs.builder()
-                                    .method(Method.GET)
-                                    .bucket(thumbnailBucketName)
-                                    .object(fileName)
-                                    .expiry(7, TimeUnit.DAYS)
-                                    .build());
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
+        return presignGet(thumbnailBucketName, fileName);
+    }
+
+    private String presignGet(String bucket, String fileName) {
+        GetObjectRequest objectRequest = GetObjectRequest.builder()
+                .bucket(bucket)
+                .key(fileName)
+                .build();
+        GetObjectPresignRequest presignRequest = GetObjectPresignRequest.builder()
+                .signatureDuration(Duration.ofDays(7))
+                .getObjectRequest(objectRequest)
+                .build();
+        return s3Presigner.presignGetObject(presignRequest).url().toString();
     }
 
     public String getType(String fileName) {
-        try {
-            StatObjectResponse statObjectResponse = minioClient
-                    .statObject(StatObjectArgs
-                            .builder()
-                            .bucket(minioBucketName)
-                            .object(fileName)
-                            .build()
-                    );
-            return statObjectResponse.contentType();
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
+        HeadObjectResponse head = s3Client.headObject(HeadObjectRequest.builder()
+                .bucket(minioBucketName)
+                .key(fileName)
+                .build());
+        return head.contentType();
     }
 
     public String getEndPointUrl() {
